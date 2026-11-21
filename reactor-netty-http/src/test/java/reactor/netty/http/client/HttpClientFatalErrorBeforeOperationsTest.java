@@ -17,6 +17,7 @@ package reactor.netty.http.client;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -31,13 +32,16 @@ import org.junit.jupiter.api.Test;
 import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.netty.BaseHttpTest;
+import reactor.netty.Connection;
+import reactor.netty.ConnectionObserver;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * A TLS handshake that fails while the connection has no {@code ChannelOperations} yet reaches
  * {@code ChannelOperationsHandler#exceptionCaught} through the {@code listener.onUncaughtException} branch.
- * The response {@code Mono} has to terminate whatever the cause of the failure is.
+ * The response {@code Mono} has to terminate with that failure, and the connection observers have to
+ * receive the original error.
  * <p>
  * In the reported scenario the cause is a {@code java.lang.OutOfMemoryError: Cannot reserve ... bytes of
  * direct buffer memory} thrown from {@code SslHandler#unwrap}. {@code SslHandler#handleUnwrapThrowable}
@@ -45,11 +49,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code SslProvider$SslReadHandler} turns that event into {@code ctx.fireExceptionCaught(cause)}.
  * The test fires the same event, so it needs neither real memory pressure nor a real unwrap failure.
  * <p>
- * The first test is the control: the same event with an ordinary exception terminates the {@code Mono}.
- * The second one uses an {@code OutOfMemoryError}. It is not wrapped on this branch, as the one on the
- * {@code ops != null} branch is ({@code ChannelOperations#wrapInboundError}), so it reaches the {@code Mono}
- * as a bare JVM-fatal error. Reactor rethrows it ({@code Exceptions#throwIfFatal}), Netty logs and swallows
- * what the handler threw, and the {@code Mono} never gets a terminal signal.
+ * The first test is the control, with an ordinary exception. The second one uses an
+ * {@code OutOfMemoryError}: Reactor rethrows a JVM fatal error ({@code Exceptions#throwIfFatal}) instead
+ * of signalling it, and Netty logs and swallows what the handler threw, so the error has to be wrapped
+ * before it is signalled to the {@code Mono}, as {@code ChannelOperations#wrapInboundError} does on the
+ * branch that has operations.
  */
 class HttpClientFatalErrorBeforeOperationsTest extends BaseHttpTest {
 
@@ -83,10 +87,24 @@ class HttpClientFatalErrorBeforeOperationsTest extends BaseHttpTest {
 				        .bindNow();
 
 		CountDownLatch terminated = new CountDownLatch(1);
+		CountDownLatch notified = new CountDownLatch(1);
+		AtomicReference<Throwable> signalled = new AtomicReference<>();
+		AtomicReference<Throwable> observed = new AtomicReference<>();
 
 		Disposable exchange =
 				createClient(disposableServer.port())
 				        .secure(spec -> spec.sslContext(sslClient))
+				        .observe(new ConnectionObserver() {
+				            @Override
+				            public void onStateChange(Connection connection, State newState) {
+				            }
+
+				            @Override
+				            public void onUncaughtException(Connection connection, Throwable error) {
+				                observed.compareAndSet(null, error);
+				                notified.countDown();
+				            }
+				        })
 				        // the handler is first in the pipeline, so the event passes the SslHandler and reaches
 				        // SslReadHandler, while the TLS handshake is not done and there are no ChannelOperations yet
 				        .doOnChannelInit((observer, channel, remoteAddress) ->
@@ -102,15 +120,30 @@ class HttpClientFatalErrorBeforeOperationsTest extends BaseHttpTest {
 				        .responseContent()
 				        .aggregate()
 				        .asString()
-				        .subscribe(v -> terminated.countDown(), e -> terminated.countDown(), terminated::countDown);
+				        .subscribe(v -> terminated.countDown(), e -> {
+				            signalled.set(e);
+				            terminated.countDown();
+				        }, terminated::countDown);
 
 		try {
 			assertThat(terminated.await(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS))
 					.as("the response Mono must emit a terminal signal (value, error or complete) for %s", cause)
 					.isTrue();
+			assertThat(rootCause(signalled.get())).as("the Mono is terminated by the handshake failure").isSameAs(cause);
+			// the observers are notified after the Mono is signalled, so wait for them as well
+			assertThat(notified.await(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)).as("the observers are notified").isTrue();
+			assertThat(observed.get()).as("the observers receive the original error").isSameAs(cause);
 		}
 		finally {
 			exchange.dispose();
 		}
+	}
+
+	static Throwable rootCause(Throwable error) {
+		Throwable root = error;
+		while (root != null && root.getCause() != null) {
+			root = root.getCause();
+		}
+		return root;
 	}
 }

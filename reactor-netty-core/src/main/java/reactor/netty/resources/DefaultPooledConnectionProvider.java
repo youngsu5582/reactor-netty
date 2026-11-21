@@ -59,6 +59,7 @@ import reactor.util.context.Context;
 import static reactor.netty.ReactorNetty.format;
 import static reactor.netty.ReactorNetty.getChannelContext;
 import static reactor.netty.ReactorNetty.setChannelContext;
+import static reactor.netty.ReactorNetty.wrapException;
 import static reactor.netty.transport.DomainSocketAddressUtils.isDomainSocketAddress;
 
 /**
@@ -244,7 +245,10 @@ final class DefaultPooledConnectionProvider extends PooledConnectionProvider<Def
 		@Override
 		public void onUncaughtException(Connection connection, Throwable error) {
 			try {
-				sink.error(error);
+				// Reactor rethrows a JVM fatal error instead of signalling it, and nothing downstream
+				// terminates. Wrap it as ChannelOperations#wrapInboundError does. The observers
+				// still receive the original error.
+				sink.error(error instanceof OutOfMemoryError ? wrapException(error) : error);
 			}
 			finally {
 				obs.onUncaughtException(connection, error);
